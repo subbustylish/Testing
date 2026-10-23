@@ -1,0 +1,6 @@
+{
+  "name": "Mobile Fixee QA",
+  "description": "Mobile application testing dashboard for managing test cases, 3-column Excel uploads, screen-wise results, and screenshot evidence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
