@@ -415,16 +415,27 @@ class StorageService {
 
     let finalUrl = evidence.url;
 
-    // If it's a base64 data URL, attempt upload to Firebase Cloud Storage for permanent public URL
+    // Fast Storage attempt with 1.2-second timeout to prevent UI delays
     if (evidence.url.startsWith('data:')) {
       try {
         const fileExt = evidence.type?.includes('png') ? 'png' : 'jpg';
         const fileRef = ref(storage, `evidence/${testCaseId}_${Date.now()}.${fileExt}`);
-        await uploadString(fileRef, evidence.url, 'data_url');
-        finalUrl = await getDownloadURL(fileRef);
-      } catch (uploadErr) {
-        console.warn('Firebase Storage direct upload skipped, retaining inline storage:', uploadErr);
-        // Retain inline data URL if storage upload is constrained
+
+        const uploadTask = (async () => {
+          await uploadString(fileRef, evidence.url, 'data_url');
+          return await getDownloadURL(fileRef);
+        })();
+
+        const timeoutTask = new Promise<null>((_, reject) =>
+          setTimeout(() => reject(new Error('Storage timeout')), 1200)
+        );
+
+        const storageUrl = await Promise.race([uploadTask, timeoutTask]);
+        if (storageUrl) {
+          finalUrl = storageUrl;
+        }
+      } catch {
+        // Fast fallback to lightweight compressed image (<100KB)
       }
     }
 

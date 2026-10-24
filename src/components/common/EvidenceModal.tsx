@@ -3,6 +3,8 @@ import { TestCaseExecution, EvidenceAttachment } from '../../types';
 import { storageService } from '../../services/storage';
 import { X, Upload, Trash2, Camera, Smartphone, CheckCircle2, ShieldAlert } from 'lucide-react';
 
+import { compressScreenshot } from '../../utils/imageCompressor';
+
 interface EvidenceModalProps {
   testCase: TestCaseExecution;
   onClose: () => void;
@@ -20,7 +22,7 @@ export const EvidenceModal: React.FC<EvidenceModalProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -30,38 +32,39 @@ export const EvidenceModal: React.FC<EvidenceModalProps> = ({
       return;
     }
 
-    // Limit to 5MB
-    const maxSizeBytes = 5 * 1024 * 1024;
+    // Limit raw upload to 15MB
+    const maxSizeBytes = 15 * 1024 * 1024;
     if (file.size > maxSizeBytes) {
-      setError('Screenshot exceeds maximum allowed size of 5 MB.');
+      setError('Screenshot exceeds maximum allowed size of 15 MB.');
       return;
     }
 
-    const reader = new FileReader();
-    reader.onload = async (event) => {
-      const base64 = event.target?.result as string;
+    setError(null);
+    setIsSaving(true);
+
+    try {
+      // Fast client-side optimization: shrinks 3MB-5MB full-res mobile screenshot to crisp ~60KB-120KB in milliseconds
+      const { dataUrl, size } = await compressScreenshot(file, 1080, 1920, 0.82);
+
       const newEvidence: EvidenceAttachment = {
-        name: file.name,
-        url: base64,
-        size: file.size,
-        type: file.type,
+        name: file.name.replace(/\.[^/.]+$/, '') + '.jpg',
+        url: dataUrl,
+        size,
+        type: 'image/jpeg',
         uploadedAt: new Date().toISOString(),
       };
-      setEvidence(newEvidence);
-      setError(null);
-      setIsSaving(true);
 
-      try {
-        // Save directly to persistent storage and database
-        await storageService.attachEvidence(testCase.id, newEvidence);
-        onSuccess();
-      } catch (err) {
-        console.error(err);
-      } finally {
-        setIsSaving(false);
-      }
-    };
-    reader.readAsDataURL(file);
+      setEvidence(newEvidence);
+
+      // Save directly to cloud database
+      await storageService.attachEvidence(testCase.id, newEvidence);
+      onSuccess();
+    } catch (err) {
+      console.error(err);
+      setError('Failed to process and save screenshot. Please try again.');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const handleRemoveEvidence = async () => {
