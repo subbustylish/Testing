@@ -1,0 +1,56 @@
+{
+  "entities": {
+    "TestCase": {
+      "title": "TestCase",
+      "description": "Represents an individual mobile test case execution record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique identifier" },
+        "testId": { "type": "string", "description": "User test case ID code" },
+        "scenario": { "type": "string", "description": "Test case description or scenario" },
+        "status": {
+          "type": "string",
+          "enum": ["Pass", "Fail", "Blocked", "Resolved", "UI Issue", "Verification", "Not Run"],
+          "description": "Execution status"
+        },
+        "screenName": { "type": "string", "description": "Target screen name" },
+        "subScreenName": { "type": "string", "description": "Sub screen or component name" },
+        "platform": { "type": "string", "description": "Mobile platform (Android, iOS, Both)" },
+        "buildVersion": { "type": "string", "description": "Build or version tag" },
+        "testerName": { "type": "string", "description": "Name of QA tester" },
+        "executionDate": { "type": "string", "description": "Execution date ISO" },
+        "batchId": { "type": "string", "description": "Associated import batch ID" },
+        "createdAt": { "type": "string", "description": "Creation timestamp" },
+        "updatedAt": { "type": "string", "description": "Last update timestamp" }
+      },
+      "required": ["id", "testId", "scenario", "status", "screenName"]
+    },
+    "ImportBatch": {
+      "title": "ImportBatch",
+      "description": "Represents an uploaded Excel test execution batch",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Batch unique ID" },
+        "fileName": { "type": "string", "description": "Excel file name" },
+        "screenName": { "type": "string", "description": "Target screen name" },
+        "subScreenName": { "type": "string", "description": "Sub screen name" },
+        "platform": { "type": "string", "description": "Platform" },
+        "buildVersion": { "type": "string", "description": "Build version" },
+        "testerName": { "type": "string", "description": "QA tester" },
+        "uploadedAt": { "type": "string", "description": "Timestamp" },
+        "totalRows": { "type": "number", "description": "Total test cases in batch" }
+      },
+      "required": ["id", "fileName", "screenName", "uploadedAt"]
+    }
+  },
+  "firestore": {
+    "/testCases/{testCaseId}": {
+      "schema": "TestCase",
+      "description": "Collection of all test case execution records"
+    },
+    "/importBatches/{batchId}": {
+      "schema": "ImportBatch",
+      "description": "Collection of Excel upload batch metadata"
+    }
+  }
+}

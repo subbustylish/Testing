@@ -40,7 +40,7 @@ export const Header: React.FC<HeaderProps> = ({ testCases = [], onNavigateToUplo
         <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px] font-semibold">
           <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
           <Database className="w-3 h-3 text-emerald-600" />
-          <span>Live Database Active</span>
+          <span>Cloud Database Live</span>
         </div>
       </div>
 

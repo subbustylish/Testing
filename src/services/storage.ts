@@ -1,4 +1,19 @@
 import {
+  collection,
+  doc,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+  getDocs,
+  onSnapshot,
+  writeBatch,
+  query,
+  where,
+  deleteField,
+} from 'firebase/firestore';
+import { ref, uploadString, getDownloadURL, deleteObject } from 'firebase/storage';
+import { db, storage, auth } from './firebase';
+import {
   TestCaseExecution,
   ExcelImportBatch,
   UserProfile,
@@ -7,10 +22,10 @@ import {
 } from '../types';
 
 const STORAGE_KEYS = {
-  TEST_CASES: 'mobile_fixee_test_cases_v3',
-  IMPORT_BATCHES: 'mobile_fixee_import_batches_v3',
-  CURRENT_USER: 'mobile_fixee_current_user_v3',
-  AUTH_SESSION: 'mobile_fixee_auth_session_v3',
+  TEST_CASES: 'mobile_fixee_test_cases_v4',
+  IMPORT_BATCHES: 'mobile_fixee_import_batches_v4',
+  CURRENT_USER: 'mobile_fixee_current_user_v4',
+  AUTH_SESSION: 'mobile_fixee_auth_session_v4',
 };
 
 export const DEFAULT_USER: UserProfile = {
@@ -19,21 +34,64 @@ export const DEFAULT_USER: UserProfile = {
   name: 'admin',
 };
 
-// Known legacy mock IDs to purge if detected in browser cache
-const LEGACY_DUMMY_IDS = new Set([
-  'tc-001', 'tc-002', 'tc-003', 'tc-004', 'tc-005',
-  'tc-006', 'tc-007', 'tc-008', 'tc-009', 'tc-010',
-  'tc-011', 'tc-012', 'tc-013', 'tc-014', 'tc-015',
-]);
+export enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+export interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  };
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo:
+        auth.currentUser?.providerData?.map((provider) => ({
+          providerId: provider.providerId,
+          email: provider.email,
+        })) || [],
+    },
+    operationType,
+    path,
+  };
+  console.warn('Firestore notice:', JSON.stringify(errInfo));
+}
 
 class StorageService {
   private listeners: Set<() => void> = new Set();
   private dbConnected: boolean = true;
-  private isSyncing: boolean = false;
+  private memoryTestCases: TestCaseExecution[] = [];
+  private memoryBatches: ExcelImportBatch[] = [];
+  private unsubscribeCases?: () => void;
+  private unsubscribeBatches?: () => void;
 
   constructor() {
-    this.purgeLegacyDummyData();
-    this.syncWithBackend();
+    this.loadFromLocal();
+    this.initFirestoreListeners();
   }
 
   public subscribe(listener: () => void): () => void {
@@ -51,84 +109,195 @@ class StorageService {
     });
   }
 
-  /**
-   * Purge any old dummy records from prior sessions
-   */
-  private purgeLegacyDummyData(): void {
+  private loadFromLocal(): void {
     if (typeof window === 'undefined') return;
-
     try {
-      // Remove any v1/v2 storage keys that had dummy records
-      localStorage.removeItem('mobile_fixee_test_cases_v2');
-      localStorage.removeItem('mobile_fixee_import_batches_v2');
-      localStorage.removeItem('mobile_fixee_test_cases_v1');
-      localStorage.removeItem('mobile_fixee_import_batches_v1');
-
-      // Check current v3 store
-      const existing = localStorage.getItem(STORAGE_KEYS.TEST_CASES);
-      if (existing) {
-        const parsed: TestCaseExecution[] = JSON.parse(existing);
-        const filtered = parsed.filter(
-          (tc) => !LEGACY_DUMMY_IDS.has(tc.id) && tc.projectName !== 'FinPay Mobile'
-        );
-        if (filtered.length !== parsed.length) {
-          localStorage.setItem(STORAGE_KEYS.TEST_CASES, JSON.stringify(filtered));
-        }
+      const tcRaw = localStorage.getItem(STORAGE_KEYS.TEST_CASES);
+      if (tcRaw) {
+        this.memoryTestCases = JSON.parse(tcRaw);
       }
-
-      const existingBatches = localStorage.getItem(STORAGE_KEYS.IMPORT_BATCHES);
-      if (existingBatches) {
-        const parsedBatches: ExcelImportBatch[] = JSON.parse(existingBatches);
-        const filteredBatches = parsedBatches.filter(
-          (b) => !b.id.startsWith('batch-init-') && b.projectName !== 'FinPay Mobile'
-        );
-        if (filteredBatches.length !== parsedBatches.length) {
-          localStorage.setItem(STORAGE_KEYS.IMPORT_BATCHES, JSON.stringify(filteredBatches));
-        }
+      const bRaw = localStorage.getItem(STORAGE_KEYS.IMPORT_BATCHES);
+      if (bRaw) {
+        this.memoryBatches = JSON.parse(bRaw);
       }
     } catch (e) {
-      console.warn('Purge error:', e);
+      console.warn('Error loading local cache:', e);
+    }
+  }
+
+  private saveToLocal(): void {
+    if (typeof window === 'undefined') return;
+    try {
+      localStorage.setItem(STORAGE_KEYS.TEST_CASES, JSON.stringify(this.memoryTestCases));
+      localStorage.setItem(STORAGE_KEYS.IMPORT_BATCHES, JSON.stringify(this.memoryBatches));
+    } catch (e) {
+      console.warn('Error saving local cache:', e);
     }
   }
 
   /**
-   * Syncs latest live database records from server DB
+   * Connects real-time Firestore listeners for multi-device sync
    */
-  public async syncWithBackend(): Promise<void> {
-    if (typeof window === 'undefined' || this.isSyncing) return;
-    this.isSyncing = true;
-
+  private initFirestoreListeners(): void {
     try {
-      const [tcRes, batchRes] = await Promise.all([
-        fetch('/api/test-cases'),
-        fetch('/api/batches'),
-      ]);
+      // 1. Test Cases Live Listener
+      const tcRef = collection(db, 'testCases');
+      this.unsubscribeCases = onSnapshot(
+        tcRef,
+        (snapshot) => {
+          const list: TestCaseExecution[] = [];
+          snapshot.forEach((docSnap) => {
+            const data = docSnap.data() as TestCaseExecution;
+            list.push({ ...data, id: docSnap.id });
+          });
+          this.memoryTestCases = list;
+          this.saveToLocal();
+          this.dbConnected = true;
+          this.notify();
+        },
+        (error) => {
+          handleFirestoreError(error, OperationType.LIST, 'testCases');
+          this.dbConnected = false;
+        }
+      );
 
-      if (tcRes.ok && batchRes.ok) {
-        const serverTestCases: TestCaseExecution[] = await tcRes.json();
-        const serverBatches: ExcelImportBatch[] = await batchRes.json();
-
-        // Filter out any legacy dummy records from server response just in case
-        const cleanCases = serverTestCases.filter(
-          (tc) => !LEGACY_DUMMY_IDS.has(tc.id) && tc.projectName !== 'FinPay Mobile'
-        );
-        const cleanBatches = serverBatches.filter(
-          (b) => !b.id.startsWith('batch-init-') && b.projectName !== 'FinPay Mobile'
-        );
-
-        localStorage.setItem(STORAGE_KEYS.TEST_CASES, JSON.stringify(cleanCases));
-        localStorage.setItem(STORAGE_KEYS.IMPORT_BATCHES, JSON.stringify(cleanBatches));
-        this.dbConnected = true;
-        this.notify();
-      } else {
-        this.dbConnected = false;
-      }
-    } catch {
-      // Backend may be starting or offline, use local storage fallback
-      this.dbConnected = false;
-    } finally {
-      this.isSyncing = false;
+      // 2. Import Batches Live Listener
+      const bRef = collection(db, 'importBatches');
+      this.unsubscribeBatches = onSnapshot(
+        bRef,
+        (snapshot) => {
+          const batches: ExcelImportBatch[] = [];
+          snapshot.forEach((docSnap) => {
+            const data = docSnap.data() as ExcelImportBatch;
+            batches.push({ ...data, id: docSnap.id });
+          });
+          // Sort by uploadedAt descending
+          batches.sort((a, b) => (b.uploadedAt || '').localeCompare(a.uploadedAt || ''));
+          this.memoryBatches = batches;
+          this.saveToLocal();
+          this.notify();
+        },
+        (error) => {
+          handleFirestoreError(error, OperationType.LIST, 'importBatches');
+        }
+      );
+    } catch (err) {
+      console.warn('Firestore listener setup fallback:', err);
     }
+  }
+
+  /**
+   * Check if this browser has test cases in local storage from prior sessions
+   */
+  public getRecoverableLocalCount(): number {
+    if (typeof window === 'undefined') return 0;
+    const candidateKeys = [
+      'mobile_fixee_test_cases_v3',
+      'mobile_fixee_test_cases_v2',
+      'mobile_fixee_test_cases_v1',
+    ];
+    let count = 0;
+    for (const key of candidateKeys) {
+      try {
+        const raw = localStorage.getItem(key);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) count += parsed.length;
+        }
+      } catch {}
+    }
+    return count;
+  }
+
+  /**
+   * Scans local browser memory for previous uploads and syncs them directly into Cloud Firestore
+   */
+  public async recoverPreviousLocalUploads(): Promise<{ recoveredCount: number }> {
+    if (typeof window === 'undefined') return { recoveredCount: 0 };
+
+    const candidateKeys = [
+      'mobile_fixee_test_cases_v3',
+      'mobile_fixee_test_cases_v2',
+      'mobile_fixee_test_cases_v1',
+      'mobile_fixee_test_cases_v4',
+    ];
+
+    const foundCases: TestCaseExecution[] = [];
+    for (const key of candidateKeys) {
+      try {
+        const raw = localStorage.getItem(key);
+        if (raw) {
+          const parsed: TestCaseExecution[] = JSON.parse(raw);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            parsed.forEach((tc) => {
+              if (
+                tc.testId &&
+                tc.scenario &&
+                !foundCases.some(
+                  (c) => c.id === tc.id || (c.testId === tc.testId && c.screenName === tc.screenName)
+                )
+              ) {
+                foundCases.push(tc);
+              }
+            });
+          }
+        }
+      } catch (e) {
+        console.warn('Error reading key', key, e);
+      }
+    }
+
+    if (foundCases.length === 0) return { recoveredCount: 0 };
+
+    const candidateBatchKeys = [
+      'mobile_fixee_import_batches_v3',
+      'mobile_fixee_import_batches_v2',
+      'mobile_fixee_import_batches_v4',
+    ];
+    const foundBatches: ExcelImportBatch[] = [];
+    for (const bKey of candidateBatchKeys) {
+      try {
+        const raw = localStorage.getItem(bKey);
+        if (raw) {
+          const parsed: ExcelImportBatch[] = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            parsed.forEach((b) => {
+              if (b.id && !foundBatches.some((existing) => existing.id === b.id)) {
+                foundBatches.push(b);
+              }
+            });
+          }
+        }
+      } catch (e) {
+        console.warn('Error checking batch key', bKey, e);
+      }
+    }
+
+    // Persist into Firebase Cloud Firestore
+    try {
+      const chunkSize = 200;
+      for (let i = 0; i < foundCases.length; i += chunkSize) {
+        const chunk = foundCases.slice(i, i + chunkSize);
+        const fbBatch = writeBatch(db);
+        chunk.forEach((tc) => {
+          fbBatch.set(doc(db, 'testCases', tc.id), tc);
+        });
+        await fbBatch.commit();
+      }
+
+      for (const b of foundBatches) {
+        await setDoc(doc(db, 'importBatches', b.id), b);
+      }
+
+      this.memoryTestCases = foundCases;
+      this.memoryBatches = foundBatches;
+      this.saveToLocal();
+      this.notify();
+    } catch (err) {
+      console.error('Failed to sync recovered cases to Firestore:', err);
+    }
+
+    return { recoveredCount: foundCases.length };
   }
 
   public isConnectedToDb(): boolean {
@@ -174,42 +343,28 @@ class StorageService {
     }
   }
 
-  // --- Test Cases Getters ---
   public getTestCases(): TestCaseExecution[] {
-    try {
-      const data = localStorage.getItem(STORAGE_KEYS.TEST_CASES);
-      if (!data) return [];
-      return JSON.parse(data);
-    } catch {
-      return [];
-    }
+    return this.memoryTestCases;
   }
 
   public getImportBatches(): ExcelImportBatch[] {
-    try {
-      const data = localStorage.getItem(STORAGE_KEYS.IMPORT_BATCHES);
-      return data ? JSON.parse(data) : [];
-    } catch {
-      return [];
-    }
+    return this.memoryBatches;
   }
 
   /**
-   * Direct status update from inline dropdown (Pass, Fail, Blocked, Resolved)
-   * Note: Resolved is considered as Pass in metrics!
+   * Direct status update from inline dropdown (Pass, Fail, Blocked, Resolved, etc.)
    */
   public async updateTestCaseStatus(
     id: string,
     newStatus: TestStatus,
     notes?: string
   ): Promise<{ success: boolean; error?: string }> {
-    const list = this.getTestCases();
-    const index = list.findIndex((tc) => tc.id === id);
+    const index = this.memoryTestCases.findIndex((tc) => tc.id === id);
     if (index === -1) {
       return { success: false, error: 'Test execution record not found.' };
     }
 
-    const current = list[index];
+    const current = this.memoryTestCases[index];
     const prevStatus = current.status;
     const user = this.getCurrentUser();
     const timestamp = new Date().toISOString();
@@ -231,75 +386,67 @@ class StorageService {
       history: [...(current.history || []), audit],
     };
 
-    list[index] = updated;
-    localStorage.setItem(STORAGE_KEYS.TEST_CASES, JSON.stringify(list));
+    // Update locally for instant responsiveness
+    this.memoryTestCases[index] = updated;
+    this.saveToLocal();
     this.notify();
 
-    // Persist to server DB
+    // Persist to Cloud Firestore
     try {
-      fetch(`/api/test-cases/${id}/status`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          status: newStatus,
-          notes,
-          performedBy: user.name,
-        }),
-      }).catch((e) => console.warn('Server sync failed:', e));
-    } catch {
-      // offline fallback
+      await setDoc(doc(db, 'testCases', id), updated);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `testCases/${id}`);
     }
 
     return { success: true };
   }
 
-
   /**
-   * Attach mobile screenshot evidence to a specific test case (hits server DB disk + local cache)
+   * Attach mobile screenshot evidence to a test case (Uploads to Cloud Storage + Firestore)
    */
   public async attachEvidence(
     testCaseId: string,
     evidence: EvidenceAttachment
   ): Promise<{ success: boolean; error?: string }> {
-    const list = this.getTestCases();
-    const index = list.findIndex((tc) => tc.id === testCaseId);
+    const index = this.memoryTestCases.findIndex((tc) => tc.id === testCaseId);
     if (index === -1) {
       return { success: false, error: 'Test case not found.' };
     }
 
-    list[index] = {
-      ...list[index],
-      evidenceScreenshot: evidence,
+    let finalUrl = evidence.url;
+
+    // If it's a base64 data URL, attempt upload to Firebase Cloud Storage for permanent public URL
+    if (evidence.url.startsWith('data:')) {
+      try {
+        const fileExt = evidence.type?.includes('png') ? 'png' : 'jpg';
+        const fileRef = ref(storage, `evidence/${testCaseId}_${Date.now()}.${fileExt}`);
+        await uploadString(fileRef, evidence.url, 'data_url');
+        finalUrl = await getDownloadURL(fileRef);
+      } catch (uploadErr) {
+        console.warn('Firebase Storage direct upload skipped, retaining inline storage:', uploadErr);
+        // Retain inline data URL if storage upload is constrained
+      }
+    }
+
+    const updatedEvidence: EvidenceAttachment = {
+      ...evidence,
+      url: finalUrl,
+    };
+
+    const updatedTc: TestCaseExecution = {
+      ...this.memoryTestCases[index],
+      evidenceScreenshot: updatedEvidence,
       updatedAt: new Date().toISOString(),
     };
 
-    localStorage.setItem(STORAGE_KEYS.TEST_CASES, JSON.stringify(list));
+    this.memoryTestCases[index] = updatedTc;
+    this.saveToLocal();
     this.notify();
 
-    // Send to server DB to store permanently on server disk
     try {
-      const res = await fetch('/api/evidence', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          testCaseId,
-          name: evidence.name,
-          dataUrl: evidence.url,
-          size: evidence.size,
-          type: evidence.type,
-        }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.evidence && data.evidence.url) {
-          // If server saved to /api/uploads/..., update local URL
-          list[index].evidenceScreenshot = data.evidence;
-          localStorage.setItem(STORAGE_KEYS.TEST_CASES, JSON.stringify(list));
-          this.notify();
-        }
-      }
+      await setDoc(doc(db, 'testCases', testCaseId), updatedTc, { merge: true });
     } catch (err) {
-      console.warn('Could not upload evidence to server DB, kept locally:', err);
+      handleFirestoreError(err, OperationType.UPDATE, `testCases/${testCaseId}`);
     }
 
     return { success: true };
@@ -309,27 +456,29 @@ class StorageService {
    * Remove evidence from a test case
    */
   public async removeEvidence(testCaseId: string): Promise<{ success: boolean }> {
-    const list = this.getTestCases();
-    const index = list.findIndex((tc) => tc.id === testCaseId);
+    const index = this.memoryTestCases.findIndex((tc) => tc.id === testCaseId);
     if (index !== -1) {
-      const updated = { ...list[index] };
+      const updated = { ...this.memoryTestCases[index] };
       delete updated.evidenceScreenshot;
-      list[index] = updated;
-      localStorage.setItem(STORAGE_KEYS.TEST_CASES, JSON.stringify(list));
+      this.memoryTestCases[index] = updated;
+      this.saveToLocal();
       this.notify();
     }
 
     try {
-      fetch(`/api/evidence/${testCaseId}`, { method: 'DELETE' }).catch(() => {});
-    } catch {
-      // ignore
+      await updateDoc(doc(db, 'testCases', testCaseId), {
+        evidenceScreenshot: deleteField(),
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `testCases/${testCaseId}`);
     }
 
     return { success: true };
   }
 
   /**
-   * Imports batch of rows into persistent store
+   * Imports batch of rows into persistent cloud store
    */
   public async importTestCases(params: {
     batchInfo: Omit<ExcelImportBatch, 'id' | 'uploadedAt' | 'summary' | 'status'>;
@@ -343,18 +492,17 @@ class StorageService {
     batchId: string;
     error?: string;
   }> {
-    const list = [...this.getTestCases()];
     const timestamp = new Date().toISOString();
     const batchId = `batch-${Date.now()}`;
     let importedCount = 0;
     let updatedCount = 0;
     let skippedCount = 0;
 
+    const casesToSave: TestCaseExecution[] = [];
+
     params.rows.forEach((row) => {
-      const existingIdx = list.findIndex(
+      const existingIdx = this.memoryTestCases.findIndex(
         (tc) =>
-          tc.projectName.toLowerCase() === params.batchInfo.projectName.toLowerCase() &&
-          tc.applicationName.toLowerCase() === params.batchInfo.applicationName.toLowerCase() &&
           tc.screenName.toLowerCase() === params.batchInfo.screenName.toLowerCase() &&
           (tc.subScreenName || '').toLowerCase() === (params.batchInfo.subScreenName || '').toLowerCase() &&
           tc.testId.toLowerCase() === row.testId.toLowerCase()
@@ -362,8 +510,8 @@ class StorageService {
 
       if (existingIdx !== -1) {
         if (params.duplicateAction === 'update') {
-          const existing = list[existingIdx];
-          list[existingIdx] = {
+          const existing = this.memoryTestCases[existingIdx];
+          const updated: TestCaseExecution = {
             ...existing,
             scenario: row.scenario,
             status: row.status,
@@ -384,6 +532,8 @@ class StorageService {
               },
             ],
           };
+          this.memoryTestCases[existingIdx] = updated;
+          casesToSave.push(updated);
           updatedCount++;
         } else {
           skippedCount++;
@@ -396,8 +546,8 @@ class StorageService {
           status: row.status,
           screenName: params.batchInfo.screenName,
           subScreenName: params.batchInfo.subScreenName || undefined,
-          projectName: params.batchInfo.projectName,
-          applicationName: params.batchInfo.applicationName,
+          projectName: '',
+          applicationName: '',
           platform: params.batchInfo.platform,
           buildVersion: params.batchInfo.buildVersion || 'v1.0.0',
           executionDate: new Date().toISOString().slice(0, 10),
@@ -406,15 +556,12 @@ class StorageService {
           createdAt: timestamp,
           updatedAt: timestamp,
         };
-        list.push(newRecord);
+        this.memoryTestCases.push(newRecord);
+        casesToSave.push(newRecord);
         importedCount++;
       }
     });
 
-    localStorage.setItem(STORAGE_KEYS.TEST_CASES, JSON.stringify(list));
-
-    // Record import batch
-    const batches = this.getImportBatches();
     const batchSummary = `Imported ${importedCount} new, updated ${updatedCount}, skipped ${skippedCount} duplicates.`;
     const newBatch: ExcelImportBatch = {
       ...params.batchInfo,
@@ -423,20 +570,26 @@ class StorageService {
       summary: batchSummary,
       status: 'Completed',
     };
-    batches.unshift(newBatch);
-    localStorage.setItem(STORAGE_KEYS.IMPORT_BATCHES, JSON.stringify(batches));
+    this.memoryBatches.unshift(newBatch);
 
+    this.saveToLocal();
     this.notify();
 
-    // Send to Server DB for full persistence
+    // Persist batch and test cases to Cloud Firestore in chunks
     try {
-      fetch('/api/test-cases/import', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params),
-      }).catch((e) => console.warn('Async server import save failed:', e));
-    } catch {
-      // offline
+      await setDoc(doc(db, 'importBatches', batchId), newBatch);
+
+      const chunkSize = 200;
+      for (let i = 0; i < casesToSave.length; i += chunkSize) {
+        const chunk = casesToSave.slice(i, i + chunkSize);
+        const fbBatch = writeBatch(db);
+        chunk.forEach((tc) => {
+          fbBatch.set(doc(db, 'testCases', tc.id), tc);
+        });
+        await fbBatch.commit();
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'testCases');
     }
 
     return {
@@ -448,30 +601,33 @@ class StorageService {
     };
   }
 
-  // -------------------------------------------------------------
-  // DELETION OPERATIONS (for removing irrelevant Excel data)
-  // -------------------------------------------------------------
-
   /**
    * Delete an entire uploaded batch AND all test cases imported with it
    */
   public async deleteBatch(batchId: string): Promise<{ success: boolean; deletedCount: number }> {
-    const batches = this.getImportBatches().filter((b) => b.id !== batchId);
-    localStorage.setItem(STORAGE_KEYS.IMPORT_BATCHES, JSON.stringify(batches));
+    this.memoryBatches = this.memoryBatches.filter((b) => b.id !== batchId);
+    const beforeCount = this.memoryTestCases.length;
+    const toDelete = this.memoryTestCases.filter((tc) => tc.importBatchId === batchId);
+    this.memoryTestCases = this.memoryTestCases.filter((tc) => tc.importBatchId !== batchId);
+    const deletedCount = beforeCount - this.memoryTestCases.length;
 
-    const list = this.getTestCases();
-    const beforeCount = list.length;
-    const remaining = list.filter((tc) => tc.importBatchId !== batchId);
-    const deletedCount = beforeCount - remaining.length;
-    localStorage.setItem(STORAGE_KEYS.TEST_CASES, JSON.stringify(remaining));
-
+    this.saveToLocal();
     this.notify();
 
-    // Server DB sync
     try {
-      fetch(`/api/batches/${batchId}`, { method: 'DELETE' }).catch(() => {});
-    } catch {
-      // ignore
+      await deleteDoc(doc(db, 'importBatches', batchId));
+
+      const chunkSize = 200;
+      for (let i = 0; i < toDelete.length; i += chunkSize) {
+        const chunk = toDelete.slice(i, i + chunkSize);
+        const fbBatch = writeBatch(db);
+        chunk.forEach((tc) => {
+          fbBatch.delete(doc(db, 'testCases', tc.id));
+        });
+        await fbBatch.commit();
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `importBatches/${batchId}`);
     }
 
     return { success: true, deletedCount };
@@ -481,84 +637,114 @@ class StorageService {
    * Delete a single test case
    */
   public async deleteTestCase(testCaseId: string): Promise<{ success: boolean }> {
-    const list = this.getTestCases().filter((tc) => tc.id !== testCaseId);
-    localStorage.setItem(STORAGE_KEYS.TEST_CASES, JSON.stringify(list));
+    this.memoryTestCases = this.memoryTestCases.filter((tc) => tc.id !== testCaseId);
+    this.saveToLocal();
     this.notify();
 
     try {
-      fetch(`/api/test-cases/${testCaseId}`, { method: 'DELETE' }).catch(() => {});
-    } catch {
-      // ignore
+      await deleteDoc(doc(db, 'testCases', testCaseId));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `testCases/${testCaseId}`);
     }
 
     return { success: true };
   }
 
   /**
-   * Bulk delete multiple test cases (e.g. user selects irrelevant rows)
+   * Bulk delete multiple test cases
    */
   public async bulkDeleteTestCases(
     testCaseIds: string[]
   ): Promise<{ success: boolean; deletedCount: number }> {
     const idSet = new Set(testCaseIds);
-    const list = this.getTestCases();
-    const beforeCount = list.length;
-    const remaining = list.filter((tc) => !idSet.has(tc.id));
-    const deletedCount = beforeCount - remaining.length;
+    const beforeCount = this.memoryTestCases.length;
+    this.memoryTestCases = this.memoryTestCases.filter((tc) => !idSet.has(tc.id));
+    const deletedCount = beforeCount - this.memoryTestCases.length;
 
-    localStorage.setItem(STORAGE_KEYS.TEST_CASES, JSON.stringify(remaining));
+    this.saveToLocal();
     this.notify();
 
     try {
-      fetch('/api/test-cases/delete-multiple', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: testCaseIds }),
-      }).catch(() => {});
-    } catch {
-      // ignore
+      const chunkSize = 200;
+      for (let i = 0; i < testCaseIds.length; i += chunkSize) {
+        const chunk = testCaseIds.slice(i, i + chunkSize);
+        const fbBatch = writeBatch(db);
+        chunk.forEach((id) => {
+          fbBatch.delete(doc(db, 'testCases', id));
+        });
+        await fbBatch.commit();
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, 'testCases');
     }
 
     return { success: true, deletedCount };
   }
 
   /**
-   * Clear all test cases for a specific screen (if wrong screen uploaded)
+   * Clear all test cases for a specific screen
    */
   public async clearScreenData(
     screenName: string
   ): Promise<{ success: boolean; deletedCount: number }> {
-    const list = this.getTestCases();
-    const beforeCount = list.length;
-    const remaining = list.filter((tc) => tc.screenName !== screenName);
-    const deletedCount = beforeCount - remaining.length;
+    const beforeCount = this.memoryTestCases.length;
+    const toDelete = this.memoryTestCases.filter((tc) => tc.screenName === screenName);
+    this.memoryTestCases = this.memoryTestCases.filter((tc) => tc.screenName !== screenName);
+    const deletedCount = beforeCount - this.memoryTestCases.length;
 
-    localStorage.setItem(STORAGE_KEYS.TEST_CASES, JSON.stringify(remaining));
+    this.saveToLocal();
     this.notify();
 
     try {
-      fetch(`/api/test-cases/screen/${encodeURIComponent(screenName)}`, {
-        method: 'DELETE',
-      }).catch(() => {});
-    } catch {
-      // ignore
+      const chunkSize = 200;
+      for (let i = 0; i < toDelete.length; i += chunkSize) {
+        const chunk = toDelete.slice(i, i + chunkSize);
+        const fbBatch = writeBatch(db);
+        chunk.forEach((tc) => {
+          fbBatch.delete(doc(db, 'testCases', tc.id));
+        });
+        await fbBatch.commit();
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, 'testCases');
     }
 
     return { success: true, deletedCount };
   }
 
   /**
-   * Reset all database records to completely clean state
+   * Reset all database records across the team
    */
   public async clearAllData(): Promise<{ success: boolean }> {
-    localStorage.removeItem(STORAGE_KEYS.TEST_CASES);
-    localStorage.removeItem(STORAGE_KEYS.IMPORT_BATCHES);
+    const casesToDelete = [...this.memoryTestCases];
+    const batchesToDelete = [...this.memoryBatches];
+
+    this.memoryTestCases = [];
+    this.memoryBatches = [];
+    this.saveToLocal();
     this.notify();
 
     try {
-      fetch('/api/clear-all', { method: 'POST' }).catch(() => {});
-    } catch {
-      // ignore
+      const chunkSize = 200;
+      for (let i = 0; i < casesToDelete.length; i += chunkSize) {
+        const chunk = casesToDelete.slice(i, i + chunkSize);
+        const fbBatch = writeBatch(db);
+        chunk.forEach((tc) => {
+          fbBatch.delete(doc(db, 'testCases', tc.id));
+        });
+        await fbBatch.commit();
+      }
+
+      for (let i = 0; i < batchesToDelete.length; i += chunkSize) {
+        const chunk = batchesToDelete.slice(i, i + chunkSize);
+        const fbBatch = writeBatch(db);
+        chunk.forEach((b) => {
+          fbBatch.delete(doc(db, 'importBatches', b.id));
+        });
+        await fbBatch.commit();
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, 'all');
     }
 
     return { success: true };

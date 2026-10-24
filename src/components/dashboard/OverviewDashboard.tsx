@@ -17,6 +17,7 @@ import {
   AlertTriangle,
   CheckSquare,
   Square,
+  Database,
 } from 'lucide-react';
 import {
   PieChart,
@@ -69,6 +70,19 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
   const [batchToDelete, setBatchToDelete] = useState<ExcelImportBatch | null>(null);
   const [testCaseToDelete, setTestCaseToDelete] = useState<TestCaseExecution | null>(null);
   const [isDeletingBulk, setIsDeletingBulk] = useState(false);
+
+  // Recovery of previous local browser data
+  const [recoverableCount, setRecoverableCount] = useState(() => storageService.getRecoverableLocalCount());
+  const [isRecovering, setIsRecovering] = useState(false);
+  const [recoverySuccessMsg, setRecoverySuccessMsg] = useState<string | null>(null);
+
+  const handleRecover = async () => {
+    setIsRecovering(true);
+    const res = await storageService.recoverPreviousLocalUploads();
+    setIsRecovering(false);
+    setRecoverableCount(0);
+    setRecoverySuccessMsg(`Successfully restored ${res.recoveredCount} test cases to Cloud Database!`);
+  };
 
   const importBatches = storageService.getImportBatches();
 
@@ -311,6 +325,48 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
           <span>Import Excel Results</span>
         </button>
       </div>
+
+      {/* Recovery Banner for Prior Local Browser Uploads */}
+      {recoverySuccessMsg && (
+        <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center justify-between">
+          <div className="flex items-center gap-2 font-medium">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+            <span>{recoverySuccessMsg}</span>
+          </div>
+          <button
+            onClick={() => setRecoverySuccessMsg(null)}
+            className="text-emerald-700 hover:text-emerald-900 font-semibold cursor-pointer"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {recoverableCount > 0 && testCases.length === 0 && (
+        <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-2xs">
+          <div className="flex items-start gap-2.5">
+            <div className="w-7 h-7 rounded-lg bg-amber-200/80 text-amber-800 flex items-center justify-center shrink-0 mt-0.5">
+              <Database className="w-4 h-4" />
+            </div>
+            <div>
+              <h3 className="font-bold text-amber-950 text-xs">
+                Found {recoverableCount} previous test cases saved in this browser's local memory
+              </h3>
+              <p className="text-amber-800 mt-0.5 text-[11px] leading-relaxed">
+                These records were saved locally prior to setting up the shared cloud database. Would you like to sync them into Firebase Cloud so your entire team can see them?
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={handleRecover}
+            disabled={isRecovering}
+            className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs rounded-xl shadow-xs transition-colors shrink-0 cursor-pointer disabled:opacity-50 flex items-center gap-1.5"
+          >
+            <UploadCloud className="w-3.5 h-3.5" />
+            <span>{isRecovering ? 'Syncing...' : 'Sync to Cloud DB'}</span>
+          </button>
+        </div>
+      )}
 
       {/* Core Metric Cards: Status */}
       <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
