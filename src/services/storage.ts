@@ -84,6 +84,7 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
 class StorageService {
   private listeners: Set<() => void> = new Set();
   private dbConnected: boolean = true;
+  private quotaExceeded: boolean = false;
   private memoryTestCases: TestCaseExecution[] = [];
   private memoryBatches: ExcelImportBatch[] = [];
   private unsubscribeCases?: () => void;
@@ -153,11 +154,21 @@ class StorageService {
           this.memoryTestCases = list;
           this.saveToLocal();
           this.dbConnected = true;
+          this.quotaExceeded = false;
           this.notify();
         },
         (error) => {
           handleFirestoreError(error, OperationType.LIST, 'testCases');
           this.dbConnected = false;
+          const msg = error instanceof Error ? error.message : String(error);
+          if (
+            msg.includes('Quota exceeded') ||
+            msg.includes('resource-exhausted') ||
+            msg.includes('Free daily read units')
+          ) {
+            this.quotaExceeded = true;
+          }
+          this.notify();
         }
       );
 
@@ -302,6 +313,10 @@ class StorageService {
 
   public isConnectedToDb(): boolean {
     return this.dbConnected;
+  }
+
+  public isQuotaExceeded(): boolean {
+    return this.quotaExceeded;
   }
 
   public isAuthenticated(): boolean {

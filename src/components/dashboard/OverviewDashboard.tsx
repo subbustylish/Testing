@@ -342,6 +342,33 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
         </div>
       )}
 
+      {/* Quota Exceeded Notice Banner */}
+      {storageService.isQuotaExceeded() && (
+        <div className="p-4 rounded-2xl bg-rose-50 border border-rose-200 text-rose-900 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-2xs">
+          <div className="flex items-start gap-2.5">
+            <div className="w-7 h-7 rounded-lg bg-rose-200/80 text-rose-800 flex items-center justify-center shrink-0 mt-0.5">
+              <AlertTriangle className="w-4 h-4" />
+            </div>
+            <div>
+              <h3 className="font-bold text-rose-950 text-xs">
+                Firebase Cloud Daily Read Limit Reached (Free Tier)
+              </h3>
+              <p className="text-rose-800 mt-0.5 text-[11px] leading-relaxed">
+                The free tier limit for daily database reads has been reached for today. The dashboard is currently displaying locally cached test cases. The daily quota resets automatically at midnight Pacific Time.
+              </p>
+            </div>
+          </div>
+          <a
+            href="https://console.firebase.google.com/project/gen-lang-client-0094158096/firestore/databases/ai-studio-testpulseaidashb-f191549e-e154-47ee-8a3d-6a1a33e13db5/data?openUpgradeDialog=true"
+            target="_blank"
+            rel="noreferrer"
+            className="px-3.5 py-2 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded-xl shadow-xs transition-colors shrink-0 flex items-center gap-1.5"
+          >
+            <span>Upgrade Database Limits</span>
+          </a>
+        </div>
+      )}
+
       {recoverableCount > 0 && testCases.length === 0 && (
         <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-2xs">
           <div className="flex items-start gap-2.5">
